@@ -4,8 +4,13 @@
   "private": true,
   "description": "Aurum - aplicação de finanças pessoais",
   "type": "commonjs",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js",
+    "security:audit": "npm audit --omit=dev --audit-level=high"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "bcryptjs": "^3.0.2",
     "cookie-parser": "^1.4.7",
