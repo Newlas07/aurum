@@ -92,6 +92,19 @@ async function issueAuth(res, user, req) {
 function cleanEmail(value) { return String(value || '').trim().toLowerCase(); }
 function validEmail(email) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254; }
 function bad(res, message, status) { return res.status(status || 400).json({ error: message }); }
+function hashIp(value) {
+  return crypto.createHmac('sha256', JWT_SECRET).update(String(value || '')).digest('hex');
+}
+async function audit(req, event, userId, details) {
+  try {
+    await pool.query(
+      'INSERT INTO audit_logs (user_id,event,ip_hash,user_agent,details) VALUES ($1,$2,$3,$4,$5::jsonb)',
+      [userId || null, event, hashIp(req.ip), String(req.get('user-agent') || '').slice(0,300), JSON.stringify(details || {})]
+    );
+  } catch (e) {
+    console.error('Falha ao registrar auditoria:', e.message);
+  }
+}
 
 async function auth(req, res, next) {
   try {
@@ -126,6 +139,8 @@ async function initDb() {
     "CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_idx ON users ((LOWER(email)))",
     "CREATE TABLE IF NOT EXISTS sessions (jti UUID PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,user_agent VARCHAR(300) NOT NULL DEFAULT '',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),expires_at TIMESTAMPTZ NOT NULL,revoked_at TIMESTAMPTZ)",
     "CREATE INDEX IF NOT EXISTS sessions_user_active_idx ON sessions (user_id,revoked_at,expires_at)",
+    "CREATE TABLE IF NOT EXISTS audit_logs (id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,event VARCHAR(80) NOT NULL,ip_hash CHAR(64) NOT NULL,user_agent VARCHAR(300) NOT NULL DEFAULT '',details JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+    "CREATE INDEX IF NOT EXISTS audit_logs_user_created_idx ON audit_logs (user_id,created_at DESC)",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ",
@@ -169,6 +184,7 @@ app.post('/api/auth/register', async function(req, res) {
     await createDefaults(client, user.id);
     await client.query('COMMIT');
     const csrfToken = await issueAuth(res, user, req);
+    await audit(req, 'account_registered', user.id, {});
     res.status(201).json({ user: { id:user.id, name:user.name, email:user.email }, csrfToken:csrfToken });
   } catch (e) {
     await client.query('ROLLBACK');
@@ -198,6 +214,7 @@ app.post('/api/auth/login', async function(req, res) {
         "UPDATE users SET failed_login_count=$1,locked_until=CASE WHEN $2::int>0 THEN NOW()+($2::text||' minutes')::interval ELSE NULL END WHERE id=$3",
         [failures, lockMinutes, user.id]
       );
+      await audit(req, 'login_failed', user.id, { locked: lockMinutes > 0 });
     }
     return bad(res, 'E-mail ou senha incorretos.', 401);
   }
@@ -214,6 +231,7 @@ app.get('/api/session', auth, function(req, res) {
 
 app.post('/api/auth/logout', auth, csrf, async function(req, res) {
   await pool.query('UPDATE sessions SET revoked_at=NOW() WHERE jti=$1', [req.sessionJti]);
+  await audit(req, 'logout', req.user.id, {});
   res.clearCookie('auth_token', { path:'/' });
   res.clearCookie('csrf_token', { path:'/' });
   res.json({ ok:true });
@@ -345,6 +363,7 @@ app.put('/api/password', auth, csrf, async function(req,res) {
   const updated=await pool.query('UPDATE users SET password_hash=$1,session_version=session_version+1 WHERE id=$2 RETURNING id,name,email,session_version',[hash,req.user.id]);
   await pool.query('UPDATE sessions SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL',[req.user.id]);
   const csrfToken=await issueAuth(res,updated.rows[0],req);
+  await audit(req, 'password_changed', req.user.id, {});
   res.json({csrfToken:csrfToken});
 });
 
@@ -378,6 +397,31 @@ app.post('/api/demo', auth, csrf, async function(req,res) {
     await client.query('ROLLBACK');
     throw e;
   } finally { client.release(); }
+});
+
+app.get('/api/security/events', auth, async function(req,res) {
+  const rows = await pool.query(
+    'SELECT event,created_at,details FROM audit_logs WHERE user_id=$1 ORDER BY created_at DESC LIMIT 30',
+    [req.user.id]
+  );
+  res.json({ events: rows.rows });
+});
+
+app.post('/api/security/logout-others', auth, csrf, async function(req,res) {
+  const result = await pool.query(
+    'UPDATE sessions SET revoked_at=NOW() WHERE user_id=$1 AND jti<>$2 AND revoked_at IS NULL',
+    [req.user.id, req.sessionJti]
+  );
+  await audit(req, 'sessions_revoked_others', req.user.id, { count: result.rowCount });
+  res.json({ ok:true, revoked:result.rowCount });
+});
+
+app.post('/api/security/logout-all', auth, csrf, async function(req,res) {
+  const result = await pool.query('UPDATE sessions SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL', [req.user.id]);
+  await audit(req, 'sessions_revoked_all', req.user.id, { count: result.rowCount });
+  res.clearCookie('auth_token', { path:'/' });
+  res.clearCookie('csrf_token', { path:'/' });
+  res.json({ ok:true, revoked:result.rowCount });
 });
 
 app.use(express.static(__dirname, { index:'index.html', extensions:['html'], setHeaders:function(res,filePath){ if(filePath.endsWith('index.html')) res.setHeader('Cache-Control','no-cache'); } }));
