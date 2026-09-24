@@ -139,5 +139,16 @@ document.addEventListener('submit',async event=>{
  }catch(error){errorEl.textContent=error.message;errorEl.scrollIntoView({block:'nearest'});}finally{button.disabled=false;button.innerHTML=oldText;}
 });
 modal.addEventListener('click',event=>{if(event.target===modal){const r=modal.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)modal.close();}});
-async function init(){try{const session=await api('/api/session');state.user=session.user;state.csrfToken=session.csrfToken;await reload();}catch(error){renderAuth();if(!/sessão|autentic|entrar|login/i.test(error.message))toast('Entre na sua conta para continuar.');}}
+async function init(){
+ if(location.hostname.endsWith('github.io')){
+  state.demo=true;
+  state.data=demoData();
+  state.user=state.data.user;
+  state.month=today().slice(0,7);
+  state.view='dashboard';
+  renderApp();
+  return;
+ }
+ try{const session=await api('/api/session');state.user=session.user;state.csrfToken=session.csrfToken;await reload();}catch(error){renderAuth();if(!/sessão|autentic|entrar|login/i.test(error.message))toast('Entre na sua conta para continuar.');}
+}
 init();
