@@ -399,6 +399,14 @@ app.post('/api/demo', auth, csrf, async function(req,res) {
   } finally { client.release(); }
 });
 
+app.get('/api/security/sessions', auth, async function(req,res) {
+  const rows = await pool.query(
+    'SELECT jti,created_at,last_seen_at,expires_at,user_agent,CASE WHEN jti=$2 THEN true ELSE false END AS current FROM sessions WHERE user_id=$1 AND revoked_at IS NULL AND expires_at>NOW() ORDER BY last_seen_at DESC',
+    [req.user.id, req.sessionJti]
+  );
+  res.json({ sessions: rows.rows });
+});
+
 app.get('/api/security/events', auth, async function(req,res) {
   const rows = await pool.query(
     'SELECT event,created_at,details FROM audit_logs WHERE user_id=$1 ORDER BY created_at DESC LIMIT 30',
@@ -422,6 +430,22 @@ app.post('/api/security/logout-all', auth, csrf, async function(req,res) {
   res.clearCookie('auth_token', { path:'/' });
   res.clearCookie('csrf_token', { path:'/' });
   res.json({ ok:true, revoked:result.rowCount });
+});
+
+app.delete('/api/security/account', auth, csrf, async function(req,res) {
+  const password = String(req.body.password || '');
+  const confirm = String(req.body.confirm || '');
+  if (confirm !== 'EXCLUIR') return bad(res, 'Digite EXCLUIR para confirmar.', 400);
+  const found = await pool.query('SELECT password_hash FROM users WHERE id=$1', [req.user.id]);
+  if (!found.rows[0] || !(await bcrypt.compare(password, found.rows[0].password_hash))) {
+    await audit(req, 'account_delete_failed', req.user.id, {});
+    return bad(res, 'Senha incorreta.', 401);
+  }
+  await audit(req, 'account_deleted', req.user.id, {});
+  await pool.query('DELETE FROM users WHERE id=$1', [req.user.id]);
+  res.clearCookie('auth_token', { path:'/' });
+  res.clearCookie('csrf_token', { path:'/' });
+  res.json({ ok:true });
 });
 
 app.use(express.static(__dirname, { index:'index.html', extensions:['html'], setHeaders:function(res,filePath){ if(filePath.endsWith('index.html')) res.setHeader('Cache-Control','no-cache'); } }));
