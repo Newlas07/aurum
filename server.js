@@ -45,6 +45,21 @@ app.use(helmet({
 }));
 app.use(express.json({ limit: '50kb', strict: true }));
 app.use(cookieParser());
+
+function sameOriginGuard(req, res, next) {
+  if (['GET','HEAD','OPTIONS'].includes(req.method)) return next();
+  const fetchSite = req.get('sec-fetch-site');
+  if (fetchSite && !['same-origin','same-site','none'].includes(fetchSite)) {
+    return res.status(403).json({ error: 'Origem da solicitação não permitida.' });
+  }
+  const origin = req.get('origin');
+  const expected = req.protocol + '://' + req.get('host');
+  if (origin && origin !== expected) {
+    return res.status(403).json({ error: 'Origem da solicitação não permitida.' });
+  }
+  next();
+}
+app.use('/api', sameOriginGuard);
 app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Muitas solicitações. Aguarde alguns minutos.' } }));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false, skipSuccessfulRequests: true, message: { error: 'Muitas tentativas de autenticação. Tente novamente mais tarde.' } }));
 
