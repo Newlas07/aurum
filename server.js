@@ -1,0 +1,342 @@
+
+const express = require('express');
+const cookieParser = require('cookie-parser');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const path = require('path');
+const { Pool, types } = require('pg');
+
+types.setTypeParser(20, Number);
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const DATABASE_URL = process.env.DATABASE_URL;
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!DATABASE_URL) throw new Error('DATABASE_URL não configurada.');
+if (!JWT_SECRET || JWT_SECRET.length < 32) throw new Error('JWT_SECRET deve ter pelo menos 32 caracteres.');
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
+});
+
+app.set('trust proxy', 1);
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      "default-src": ["'self'"],
+      "script-src": ["'self'"],
+      "style-src": ["'self'", "'unsafe-inline'"],
+      "img-src": ["'self'", "data:"],
+      "connect-src": ["'self'"],
+      "font-src": ["'self'"],
+      "object-src": ["'none'"],
+      "base-uri": ["'self'"],
+      "frame-ancestors": ["'none'"]
+    }
+  }
+}));
+app.use(express.json({ limit: '200kb' }));
+app.use(cookieParser());
+app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 40, standardHeaders: 'draft-8', legacyHeaders: false }));
+
+const secureCookie = process.env.NODE_ENV === 'production';
+const authCookie = { httpOnly: true, secure: secureCookie, sameSite: 'lax', maxAge: 604800000, path: '/' };
+const csrfCookie = { httpOnly: false, secure: secureCookie, sameSite: 'lax', maxAge: 604800000, path: '/' };
+
+function issueCsrf(res) {
+  const token = crypto.randomBytes(24).toString('hex');
+  res.cookie('csrf_token', token, csrfCookie);
+  return token;
+}
+
+function issueAuth(res, user) {
+  const token = jwt.sign({ uid: user.id, sv: user.session_version }, JWT_SECRET, { expiresIn: '7d' });
+  res.cookie('auth_token', token, authCookie);
+  return issueCsrf(res);
+}
+
+function cleanEmail(value) { return String(value || '').trim().toLowerCase(); }
+function validEmail(email) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 254; }
+function bad(res, message, status) { return res.status(status || 400).json({ error: message }); }
+
+async function auth(req, res, next) {
+  try {
+    const token = req.cookies.auth_token;
+    if (!token) return bad(res, 'Sessão não encontrada. Entre novamente.', 401);
+    const payload = jwt.verify(token, JWT_SECRET);
+    const result = await pool.query('SELECT id,name,email,session_version FROM users WHERE id=$1', [payload.uid]);
+    const user = result.rows[0];
+    if (!user || user.session_version !== payload.sv) return bad(res, 'Sessão expirada. Entre novamente.', 401);
+    req.user = user;
+    next();
+  } catch (e) {
+    return bad(res, 'Sessão inválida. Entre novamente.', 401);
+  }
+}
+
+function csrf(req, res, next) {
+  const sent = req.get('x-csrf-token');
+  const cookie = req.cookies.csrf_token;
+  if (!sent || !cookie || sent !== cookie) return bad(res, 'Sessão de segurança expirada. Recarregue a página.', 403);
+  next();
+}
+
+async function initDb() {
+  const sql = [
+    "CREATE TABLE IF NOT EXISTS users (id BIGSERIAL PRIMARY KEY,name VARCHAR(80) NOT NULL,email VARCHAR(254) NOT NULL,password_hash TEXT NOT NULL,session_version INTEGER NOT NULL DEFAULT 0,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+    "CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_idx ON users ((LOWER(email)))",
+    "CREATE TABLE IF NOT EXISTS categories (id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,name VARCHAR(40) NOT NULL,type VARCHAR(10) NOT NULL CHECK (type IN ('income','expense')),color VARCHAR(20) NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+    "CREATE TABLE IF NOT EXISTS transactions (id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,title VARCHAR(120) NOT NULL,type VARCHAR(10) NOT NULL CHECK (type IN ('income','expense')),amount BIGINT NOT NULL CHECK (amount > 0),category_id BIGINT REFERENCES categories(id) ON DELETE SET NULL,date DATE NOT NULL,status VARCHAR(10) NOT NULL CHECK (status IN ('paid','pending')),notes VARCHAR(1000) NOT NULL DEFAULT '',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+    "CREATE TABLE IF NOT EXISTS budgets (id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,category_id BIGINT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,month CHAR(7) NOT NULL,\"limit\" BIGINT NOT NULL CHECK (\"limit\" > 0),created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+    "CREATE TABLE IF NOT EXISTS goals (id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,name VARCHAR(80) NOT NULL,target BIGINT NOT NULL CHECK (target > 0),saved BIGINT NOT NULL DEFAULT 0 CHECK (saved >= 0),deadline DATE NOT NULL,color VARCHAR(20) NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+  ];
+  for (const q of sql) await pool.query(q);
+}
+
+const defaultCategories = [
+  ['Salário','income','#709487'],['Freelance','income','#c9aa76'],['Moradia','expense','#6f8ea2'],
+  ['Alimentação','expense','#b392a3'],['Transporte','expense','#8e97bc'],['Lazer','expense','#c8836e'],
+  ['Saúde','expense','#819268'],['Educação','expense','#61777e']
+];
+
+async function createDefaults(client, userId) {
+  for (const row of defaultCategories) {
+    await client.query('INSERT INTO categories (user_id,name,type,color) VALUES ($1,$2,$3,$4)', [userId, row[0], row[1], row[2]]);
+  }
+}
+
+app.get('/health', function(req, res) { res.json({ ok: true }); });
+
+app.post('/api/auth/register', async function(req, res) {
+  const name = String(req.body.name || '').trim();
+  const email = cleanEmail(req.body.email);
+  const password = String(req.body.password || '');
+  if (name.length < 2 || name.length > 80) return bad(res, 'Informe um nome válido.');
+  if (!validEmail(email)) return bad(res, 'Informe um e-mail válido.');
+  if (password.length < 12 || password.length > 128) return bad(res, 'A senha deve ter entre 12 e 128 caracteres.');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const exists = await client.query('SELECT 1 FROM users WHERE LOWER(email)=LOWER($1)', [email]);
+    if (exists.rowCount) { await client.query('ROLLBACK'); return bad(res, 'Já existe uma conta com este e-mail.', 409); }
+    const hash = await bcrypt.hash(password, 12);
+    const result = await client.query('INSERT INTO users (name,email,password_hash) VALUES ($1,$2,$3) RETURNING id,name,email,session_version', [name,email,hash]);
+    const user = result.rows[0];
+    await createDefaults(client, user.id);
+    await client.query('COMMIT');
+    const csrfToken = issueAuth(res, user);
+    res.status(201).json({ user: { id:user.id, name:user.name, email:user.email }, csrfToken:csrfToken });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    bad(res, 'Não foi possível criar a conta.', 500);
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/auth/login', async function(req, res) {
+  const email = cleanEmail(req.body.email);
+  const password = String(req.body.password || '');
+  const result = await pool.query('SELECT id,name,email,password_hash,session_version FROM users WHERE LOWER(email)=LOWER($1)', [email]);
+  const user = result.rows[0];
+  if (!user || !(await bcrypt.compare(password, user.password_hash))) return bad(res, 'E-mail ou senha incorretos.', 401);
+  const csrfToken = issueAuth(res, user);
+  res.json({ user: { id:user.id, name:user.name, email:user.email }, csrfToken:csrfToken });
+});
+
+app.get('/api/session', auth, function(req, res) {
+  const csrfToken = req.cookies.csrf_token || issueCsrf(res);
+  res.json({ user: { id:req.user.id, name:req.user.name, email:req.user.email }, csrfToken:csrfToken });
+});
+
+app.post('/api/auth/logout', auth, csrf, function(req, res) {
+  res.clearCookie('auth_token', { path:'/' });
+  res.clearCookie('csrf_token', { path:'/' });
+  res.json({ ok:true });
+});
+
+app.get('/api/data', auth, async function(req, res) {
+  const uid = req.user.id;
+  const categories = await pool.query('SELECT id,name,type,color FROM categories WHERE user_id=$1 ORDER BY id', [uid]);
+  const transactions = await pool.query("SELECT id,title,type,amount,category_id,TO_CHAR(date,'YYYY-MM-DD') AS date,status,notes FROM transactions WHERE user_id=$1 ORDER BY date DESC,id DESC", [uid]);
+  const budgets = await pool.query('SELECT id,category_id,month,\"limit\" FROM budgets WHERE user_id=$1 ORDER BY month DESC,id', [uid]);
+  const goals = await pool.query("SELECT id,name,target,saved,TO_CHAR(deadline,'YYYY-MM-DD') AS deadline,color FROM goals WHERE user_id=$1 ORDER BY deadline,id", [uid]);
+  res.json({ user:{id:req.user.id,name:req.user.name,email:req.user.email}, categories:categories.rows, transactions:transactions.rows, budgets:budgets.rows, goals:goals.rows });
+});
+
+function parseMoney(v) { const n=Number(v); return Number.isSafeInteger(n) && n>=0 && n<=1000000000000 ? n : null; }
+function validType(v) { return v==='income' || v==='expense'; }
+function validStatus(v) { return v==='paid' || v==='pending'; }
+function validDate(v) { return /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')); }
+function validMonth(v) { return /^\d{4}-\d{2}$/.test(String(v || '')); }
+function validColor(v) { return /^#[0-9a-fA-F]{6}$/.test(String(v || '')); }
+
+async function ownedCategory(userId, id, type) {
+  const result = await pool.query('SELECT id,type FROM categories WHERE id=$1 AND user_id=$2', [id,userId]);
+  const row = result.rows[0];
+  return row && (!type || row.type===type) ? row : null;
+}
+
+app.post('/api/transactions', auth, csrf, async function(req,res) {
+  const title=String(req.body.title||'').trim(), type=req.body.type, amount=parseMoney(req.body.amount), categoryId=req.body.category_id, date=req.body.date, status=req.body.status, notes=String(req.body.notes||'').slice(0,1000);
+  if (!title || title.length>120 || !validType(type) || !amount || !validDate(date) || !validStatus(status)) return bad(res,'Revise os dados do lançamento.');
+  if (!(await ownedCategory(req.user.id,categoryId,type))) return bad(res,'Categoria inválida.');
+  const r=await pool.query('INSERT INTO transactions (user_id,title,type,amount,category_id,date,status,notes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id',[req.user.id,title,type,amount,categoryId,date,status,notes]);
+  res.status(201).json({id:r.rows[0].id});
+});
+
+app.put('/api/transactions/:id', auth, csrf, async function(req,res) {
+  const title=String(req.body.title||'').trim(), type=req.body.type, amount=parseMoney(req.body.amount), categoryId=req.body.category_id, date=req.body.date, status=req.body.status, notes=String(req.body.notes||'').slice(0,1000);
+  if (!title || title.length>120 || !validType(type) || !amount || !validDate(date) || !validStatus(status)) return bad(res,'Revise os dados do lançamento.');
+  if (!(await ownedCategory(req.user.id,categoryId,type))) return bad(res,'Categoria inválida.');
+  const r=await pool.query('UPDATE transactions SET title=$1,type=$2,amount=$3,category_id=$4,date=$5,status=$6,notes=$7 WHERE id=$8 AND user_id=$9',[title,type,amount,categoryId,date,status,notes,req.params.id,req.user.id]);
+  if (!r.rowCount) return bad(res,'Lançamento não encontrado.',404);
+  res.json({ok:true});
+});
+
+app.delete('/api/transactions/:id', auth, csrf, async function(req,res) {
+  const r=await pool.query('DELETE FROM transactions WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);
+  if (!r.rowCount) return bad(res,'Lançamento não encontrado.',404);
+  res.json({ok:true});
+});
+
+app.post('/api/budgets', auth, csrf, async function(req,res) {
+  const limit=parseMoney(req.body.limit);
+  if (!limit || !validMonth(req.body.month)) return bad(res,'Revise os dados do orçamento.');
+  if (!(await ownedCategory(req.user.id,req.body.category_id,'expense'))) return bad(res,'Categoria inválida.');
+  const r=await pool.query('INSERT INTO budgets (user_id,category_id,month,\"limit\") VALUES ($1,$2,$3,$4) RETURNING id',[req.user.id,req.body.category_id,req.body.month,limit]);
+  res.status(201).json({id:r.rows[0].id});
+});
+
+app.put('/api/budgets/:id', auth, csrf, async function(req,res) {
+  const limit=parseMoney(req.body.limit);
+  if (!limit || !validMonth(req.body.month)) return bad(res,'Revise os dados do orçamento.');
+  if (!(await ownedCategory(req.user.id,req.body.category_id,'expense'))) return bad(res,'Categoria inválida.');
+  const r=await pool.query('UPDATE budgets SET category_id=$1,month=$2,\"limit\"=$3 WHERE id=$4 AND user_id=$5',[req.body.category_id,req.body.month,limit,req.params.id,req.user.id]);
+  if (!r.rowCount) return bad(res,'Orçamento não encontrado.',404);
+  res.json({ok:true});
+});
+
+app.delete('/api/budgets/:id', auth, csrf, async function(req,res) {
+  const r=await pool.query('DELETE FROM budgets WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);
+  if (!r.rowCount) return bad(res,'Orçamento não encontrado.',404);
+  res.json({ok:true});
+});
+
+app.post('/api/goals', auth, csrf, async function(req,res) {
+  const target=parseMoney(req.body.target), saved=parseMoney(req.body.saved), name=String(req.body.name||'').trim();
+  if (name.length<2 || name.length>80 || !target || saved===null || !validDate(req.body.deadline) || !validColor(req.body.color)) return bad(res,'Revise os dados do objetivo.');
+  const r=await pool.query('INSERT INTO goals (user_id,name,target,saved,deadline,color) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',[req.user.id,name,target,saved,req.body.deadline,req.body.color]);
+  res.status(201).json({id:r.rows[0].id});
+});
+
+app.put('/api/goals/:id', auth, csrf, async function(req,res) {
+  const target=parseMoney(req.body.target), saved=parseMoney(req.body.saved), name=String(req.body.name||'').trim();
+  if (name.length<2 || name.length>80 || !target || saved===null || !validDate(req.body.deadline) || !validColor(req.body.color)) return bad(res,'Revise os dados do objetivo.');
+  const r=await pool.query('UPDATE goals SET name=$1,target=$2,saved=$3,deadline=$4,color=$5 WHERE id=$6 AND user_id=$7',[name,target,saved,req.body.deadline,req.body.color,req.params.id,req.user.id]);
+  if (!r.rowCount) return bad(res,'Objetivo não encontrado.',404);
+  res.json({ok:true});
+});
+
+app.delete('/api/goals/:id', auth, csrf, async function(req,res) {
+  const r=await pool.query('DELETE FROM goals WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);
+  if (!r.rowCount) return bad(res,'Objetivo não encontrado.',404);
+  res.json({ok:true});
+});
+
+app.post('/api/categories', auth, csrf, async function(req,res) {
+  const name=String(req.body.name||'').trim();
+  if (name.length<2 || name.length>40 || !validType(req.body.type) || !validColor(req.body.color)) return bad(res,'Revise os dados da categoria.');
+  const r=await pool.query('INSERT INTO categories (user_id,name,type,color) VALUES ($1,$2,$3,$4) RETURNING id',[req.user.id,name,req.body.type,req.body.color]);
+  res.status(201).json({id:r.rows[0].id});
+});
+
+app.put('/api/categories/:id', auth, csrf, async function(req,res) {
+  const name=String(req.body.name||'').trim();
+  if (name.length<2 || name.length>40 || !validType(req.body.type) || !validColor(req.body.color)) return bad(res,'Revise os dados da categoria.');
+  const r=await pool.query('UPDATE categories SET name=$1,type=$2,color=$3 WHERE id=$4 AND user_id=$5',[name,req.body.type,req.body.color,req.params.id,req.user.id]);
+  if (!r.rowCount) return bad(res,'Categoria não encontrada.',404);
+  res.json({ok:true});
+});
+
+app.delete('/api/categories/:id', auth, csrf, async function(req,res) {
+  const r=await pool.query('DELETE FROM categories WHERE id=$1 AND user_id=$2',[req.params.id,req.user.id]);
+  if (!r.rowCount) return bad(res,'Categoria não encontrada.',404);
+  res.json({ok:true});
+});
+
+app.put('/api/profile', auth, csrf, async function(req,res) {
+  const name=String(req.body.name||'').trim();
+  if (name.length<2 || name.length>80) return bad(res,'Informe um nome válido.');
+  await pool.query('UPDATE users SET name=$1 WHERE id=$2',[name,req.user.id]);
+  res.json({ok:true});
+});
+
+app.put('/api/password', auth, csrf, async function(req,res) {
+  const currentPassword=String(req.body.currentPassword||''), newPassword=String(req.body.newPassword||'');
+  if (newPassword.length<12 || newPassword.length>128) return bad(res,'A nova senha deve ter entre 12 e 128 caracteres.');
+  const found=await pool.query('SELECT password_hash,session_version FROM users WHERE id=$1',[req.user.id]);
+  if (!(await bcrypt.compare(currentPassword,found.rows[0].password_hash))) return bad(res,'A senha atual está incorreta.',401);
+  const hash=await bcrypt.hash(newPassword,12);
+  const updated=await pool.query('UPDATE users SET password_hash=$1,session_version=session_version+1 WHERE id=$2 RETURNING id,name,email,session_version',[hash,req.user.id]);
+  const csrfToken=issueAuth(res,updated.rows[0]);
+  res.json({csrfToken:csrfToken});
+});
+
+app.post('/api/demo', auth, csrf, async function(req,res) {
+  const uid=req.user.id;
+  const counts=await pool.query('SELECT (SELECT COUNT(*) FROM transactions WHERE user_id=$1) AS tx,(SELECT COUNT(*) FROM budgets WHERE user_id=$1) AS budgets,(SELECT COUNT(*) FROM goals WHERE user_id=$1) AS goals',[uid]);
+  if (Number(counts.rows[0].tx)||Number(counts.rows[0].budgets)||Number(counts.rows[0].goals)) return bad(res,'Os exemplos só podem ser adicionados a uma conta ainda vazia.',409);
+  const cats=await pool.query('SELECT id,name FROM categories WHERE user_id=$1',[uid]);
+  const byName=Object.fromEntries(cats.rows.map(function(c){return [c.name,c.id];}));
+  const now=new Date(), month=String(now.getFullYear())+'-'+String(now.getMonth()+1).padStart(2,'0');
+  function d(day){ return month+'-'+String(day).padStart(2,'0'); }
+  const sample=[
+    ['Salário mensal','income',850000,byName['Salário'],d(5),'paid'],
+    ['Aluguel do apartamento','expense',215000,byName['Moradia'],d(5),'paid'],
+    ['Supermercado','expense',56890,byName['Alimentação'],d(9),'paid'],
+    ['Plano de saúde','expense',38900,byName['Saúde'],d(10),'paid'],
+    ['Combustível','expense',24500,byName['Transporte'],d(14),'paid'],
+    ['Cinema e café','expense',12600,byName['Lazer'],d(22),'paid']
+  ];
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const row of sample) await client.query('INSERT INTO transactions (user_id,title,type,amount,category_id,date,status,notes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',[uid,row[0],row[1],row[2],row[3],row[4],row[5],'']);
+    await client.query('INSERT INTO budgets (user_id,category_id,month,\"limit\") VALUES ($1,$2,$3,$4)',[uid,byName['Alimentação'],month,120000]);
+    const deadline=new Date(now.getFullYear()+1,now.getMonth(),1);
+    const deadlineText=String(deadline.getFullYear())+'-'+String(deadline.getMonth()+1).padStart(2,'0')+'-01';
+    await client.query('INSERT INTO goals (user_id,name,target,saved,deadline,color) VALUES ($1,$2,$3,$4,$5,$6)',[uid,'Reserva de emergência',3000000,450000,deadlineText,'#709487']);
+    await client.query('COMMIT');
+    res.json({ok:true});
+  } catch(e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally { client.release(); }
+});
+
+app.use(express.static(__dirname, { index:'index.html', extensions:['html'], setHeaders:function(res,filePath){ if(filePath.endsWith('index.html')) res.setHeader('Cache-Control','no-cache'); } }));
+
+app.get('/{*splat}', function(req,res) {
+  if (req.path.startsWith('/api/')) return res.status(404).json({error:'Rota não encontrada.'});
+  res.sendFile(path.join(__dirname,'index.html'));
+});
+
+app.use(function(err,req,res,next) {
+  console.error(err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({error:'Ocorreu um erro interno. Tente novamente.'});
+});
+
+initDb().then(function(){
+  app.listen(PORT,'0.0.0.0',function(){ console.log('Aurum online na porta '+PORT); });
+}).catch(function(err){
+  console.error('Falha ao inicializar o banco:',err);
+  process.exit(1);
+});
