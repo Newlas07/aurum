@@ -109,6 +109,9 @@ async function initDb() {
   const sql = [
     "CREATE TABLE IF NOT EXISTS users (id BIGSERIAL PRIMARY KEY,name VARCHAR(80) NOT NULL,email VARCHAR(254) NOT NULL,password_hash TEXT NOT NULL,session_version INTEGER NOT NULL DEFAULT 0,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
     "CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_idx ON users ((LOWER(email)))",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ",
     "CREATE TABLE IF NOT EXISTS categories (id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,name VARCHAR(40) NOT NULL,type VARCHAR(10) NOT NULL CHECK (type IN ('income','expense')),color VARCHAR(20) NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
     "CREATE TABLE IF NOT EXISTS transactions (id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,title VARCHAR(120) NOT NULL,type VARCHAR(10) NOT NULL CHECK (type IN ('income','expense')),amount BIGINT NOT NULL CHECK (amount > 0),category_id BIGINT REFERENCES categories(id) ON DELETE SET NULL,date DATE NOT NULL,status VARCHAR(10) NOT NULL CHECK (status IN ('paid','pending')),notes VARCHAR(1000) NOT NULL DEFAULT '',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
     "CREATE TABLE IF NOT EXISTS budgets (id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,category_id BIGINT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,month CHAR(7) NOT NULL,\"limit\" BIGINT NOT NULL CHECK (\"limit\" > 0),created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
@@ -162,9 +165,27 @@ app.post('/api/auth/register', async function(req, res) {
 app.post('/api/auth/login', async function(req, res) {
   const email = cleanEmail(req.body.email);
   const password = String(req.body.password || '');
-  const result = await pool.query('SELECT id,name,email,password_hash,session_version FROM users WHERE LOWER(email)=LOWER($1)', [email]);
+  const result = await pool.query('SELECT id,name,email,password_hash,session_version,failed_login_count,locked_until FROM users WHERE LOWER(email)=LOWER($1)', [email]);
   const user = result.rows[0];
-  if (!user || !(await bcrypt.compare(password, user.password_hash))) return bad(res, 'E-mail ou senha incorretos.', 401);
+
+  if (user && user.locked_until && new Date(user.locked_until) > new Date()) {
+    return bad(res, 'Muitas tentativas. Aguarde alguns minutos e tente novamente.', 429);
+  }
+
+  const valid = user ? await bcrypt.compare(password, user.password_hash) : false;
+  if (!user || !valid) {
+    if (user) {
+      const failures = Number(user.failed_login_count || 0) + 1;
+      const lockMinutes = failures >= 5 ? Math.min(60, 5 * Math.pow(2, Math.min(failures - 5, 4))) : 0;
+      await pool.query(
+        "UPDATE users SET failed_login_count=$1,locked_until=CASE WHEN $2::int>0 THEN NOW()+($2::text||' minutes')::interval ELSE NULL END WHERE id=$3",
+        [failures, lockMinutes, user.id]
+      );
+    }
+    return bad(res, 'E-mail ou senha incorretos.', 401);
+  }
+
+  await pool.query('UPDATE users SET failed_login_count=0,locked_until=NULL,last_login_at=NOW() WHERE id=$1', [user.id]);
   const csrfToken = issueAuth(res, user);
   res.json({ user: { id:user.id, name:user.name, email:user.email }, csrfToken:csrfToken });
 });
