@@ -25,6 +25,7 @@ const pool = new Pool({
 });
 
 app.set('trust proxy', 1);
+app.disable('x-powered-by');
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -40,13 +41,14 @@ app.use(helmet({
     }
   }
 }));
-app.use(express.json({ limit: '200kb' }));
+app.use(express.json({ limit: '50kb', strict: true }));
 app.use(cookieParser());
-app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 40, standardHeaders: 'draft-8', legacyHeaders: false }));
+app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Muitas solicitações. Aguarde alguns minutos.' } }));
+app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false, skipSuccessfulRequests: true, message: { error: 'Muitas tentativas de autenticação. Tente novamente mais tarde.' } }));
 
 const secureCookie = process.env.NODE_ENV === 'production';
-const authCookie = { httpOnly: true, secure: secureCookie, sameSite: 'lax', maxAge: 604800000, path: '/' };
-const csrfCookie = { httpOnly: false, secure: secureCookie, sameSite: 'lax', maxAge: 604800000, path: '/' };
+const authCookie = { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 604800000, path: '/' };
+const csrfCookie = { httpOnly: false, secure: secureCookie, sameSite: 'strict', maxAge: 604800000, path: '/' };
 
 function issueCsrf(res) {
   const token = crypto.randomBytes(24).toString('hex');
