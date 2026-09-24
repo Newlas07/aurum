@@ -73,8 +73,18 @@ function issueCsrf(res) {
   return token;
 }
 
-function issueAuth(res, user) {
-  const token = jwt.sign({ uid: user.id, sv: user.session_version }, JWT_SECRET, { expiresIn: SESSION_TTL_HOURS + 'h', issuer: 'aurum', audience: 'aurum-web' });
+async function issueAuth(res, user, req) {
+  const jti = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
+  await pool.query(
+    'INSERT INTO sessions (jti,user_id,user_agent,expires_at) VALUES ($1,$2,$3,$4)',
+    [jti, user.id, String(req.get('user-agent') || '').slice(0,300), expiresAt]
+  );
+  const token = jwt.sign(
+    { uid: user.id, sv: user.session_version },
+    JWT_SECRET,
+    { expiresIn: SESSION_TTL_HOURS + 'h', issuer: 'aurum', audience: 'aurum-web', jwtid: jti }
+  );
   res.cookie('auth_token', token, authCookie);
   return issueCsrf(res);
 }
@@ -88,10 +98,15 @@ async function auth(req, res, next) {
     const token = req.cookies.auth_token;
     if (!token) return bad(res, 'Sessão não encontrada. Entre novamente.', 401);
     const payload = jwt.verify(token, JWT_SECRET, { issuer: 'aurum', audience: 'aurum-web' });
-    const result = await pool.query('SELECT id,name,email,session_version FROM users WHERE id=$1', [payload.uid]);
+    const result = await pool.query(
+      'SELECT u.id,u.name,u.email,u.session_version,s.jti FROM users u JOIN sessions s ON s.user_id=u.id WHERE u.id=$1 AND s.jti=$2 AND s.revoked_at IS NULL AND s.expires_at>NOW()',
+      [payload.uid, payload.jti]
+    );
     const user = result.rows[0];
     if (!user || user.session_version !== payload.sv) return bad(res, 'Sessão expirada. Entre novamente.', 401);
     req.user = user;
+    req.sessionJti = payload.jti;
+    pool.query('UPDATE sessions SET last_seen_at=NOW() WHERE jti=$1', [payload.jti]).catch(()=>{});
     next();
   } catch (e) {
     return bad(res, 'Sessão inválida. Entre novamente.', 401);
@@ -109,6 +124,8 @@ async function initDb() {
   const sql = [
     "CREATE TABLE IF NOT EXISTS users (id BIGSERIAL PRIMARY KEY,name VARCHAR(80) NOT NULL,email VARCHAR(254) NOT NULL,password_hash TEXT NOT NULL,session_version INTEGER NOT NULL DEFAULT 0,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
     "CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_idx ON users ((LOWER(email)))",
+    "CREATE TABLE IF NOT EXISTS sessions (jti UUID PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,user_agent VARCHAR(300) NOT NULL DEFAULT '',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),expires_at TIMESTAMPTZ NOT NULL,revoked_at TIMESTAMPTZ)",
+    "CREATE INDEX IF NOT EXISTS sessions_user_active_idx ON sessions (user_id,revoked_at,expires_at)",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ",
@@ -151,7 +168,7 @@ app.post('/api/auth/register', async function(req, res) {
     const user = result.rows[0];
     await createDefaults(client, user.id);
     await client.query('COMMIT');
-    const csrfToken = issueAuth(res, user);
+    const csrfToken = await issueAuth(res, user, req);
     res.status(201).json({ user: { id:user.id, name:user.name, email:user.email }, csrfToken:csrfToken });
   } catch (e) {
     await client.query('ROLLBACK');
@@ -195,7 +212,8 @@ app.get('/api/session', auth, function(req, res) {
   res.json({ user: { id:req.user.id, name:req.user.name, email:req.user.email }, csrfToken:csrfToken });
 });
 
-app.post('/api/auth/logout', auth, csrf, function(req, res) {
+app.post('/api/auth/logout', auth, csrf, async function(req, res) {
+  await pool.query('UPDATE sessions SET revoked_at=NOW() WHERE jti=$1', [req.sessionJti]);
   res.clearCookie('auth_token', { path:'/' });
   res.clearCookie('csrf_token', { path:'/' });
   res.json({ ok:true });
@@ -325,7 +343,8 @@ app.put('/api/password', auth, csrf, async function(req,res) {
   if (!(await bcrypt.compare(currentPassword,found.rows[0].password_hash))) return bad(res,'A senha atual está incorreta.',401);
   const hash=await bcrypt.hash(newPassword,12);
   const updated=await pool.query('UPDATE users SET password_hash=$1,session_version=session_version+1 WHERE id=$2 RETURNING id,name,email,session_version',[hash,req.user.id]);
-  const csrfToken=issueAuth(res,updated.rows[0]);
+  await pool.query('UPDATE sessions SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL',[req.user.id]);
+  const csrfToken=await issueAuth(res,updated.rows[0],req);
   res.json({csrfToken:csrfToken});
 });
 
