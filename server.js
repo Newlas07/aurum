@@ -15,6 +15,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET;
+const SESSION_TTL_HOURS = Math.min(Math.max(Number(process.env.SESSION_TTL_HOURS || 12), 1), 168);
+const SESSION_TTL_MS = SESSION_TTL_HOURS * 60 * 60 * 1000;
 
 if (!DATABASE_URL) throw new Error('DATABASE_URL não configurada.');
 if (!JWT_SECRET || JWT_SECRET.length < 32) throw new Error('JWT_SECRET deve ter pelo menos 32 caracteres.');
@@ -47,8 +49,8 @@ app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeader
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false, skipSuccessfulRequests: true, message: { error: 'Muitas tentativas de autenticação. Tente novamente mais tarde.' } }));
 
 const secureCookie = process.env.NODE_ENV === 'production';
-const authCookie = { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: 604800000, path: '/' };
-const csrfCookie = { httpOnly: false, secure: secureCookie, sameSite: 'strict', maxAge: 604800000, path: '/' };
+const authCookie = { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: SESSION_TTL_MS, path: '/' };
+const csrfCookie = { httpOnly: false, secure: secureCookie, sameSite: 'strict', maxAge: SESSION_TTL_MS, path: '/' };
 
 function issueCsrf(res) {
   const token = crypto.randomBytes(24).toString('hex');
@@ -57,7 +59,7 @@ function issueCsrf(res) {
 }
 
 function issueAuth(res, user) {
-  const token = jwt.sign({ uid: user.id, sv: user.session_version }, JWT_SECRET, { expiresIn: '7d' });
+  const token = jwt.sign({ uid: user.id, sv: user.session_version }, JWT_SECRET, { expiresIn: SESSION_TTL_HOURS + 'h', issuer: 'aurum', audience: 'aurum-web' });
   res.cookie('auth_token', token, authCookie);
   return issueCsrf(res);
 }
@@ -70,7 +72,7 @@ async function auth(req, res, next) {
   try {
     const token = req.cookies.auth_token;
     if (!token) return bad(res, 'Sessão não encontrada. Entre novamente.', 401);
-    const payload = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, JWT_SECRET, { issuer: 'aurum', audience: 'aurum-web' });
     const result = await pool.query('SELECT id,name,email,session_version FROM users WHERE id=$1', [payload.uid]);
     const user = result.rows[0];
     if (!user || user.session_version !== payload.sv) return bad(res, 'Sessão expirada. Entre novamente.', 401);
@@ -120,7 +122,7 @@ app.post('/api/auth/register', async function(req, res) {
   const password = String(req.body.password || '');
   if (name.length < 2 || name.length > 80) return bad(res, 'Informe um nome válido.');
   if (!validEmail(email)) return bad(res, 'Informe um e-mail válido.');
-  if (password.length < 12 || password.length > 128) return bad(res, 'A senha deve ter entre 12 e 128 caracteres.');
+  if (password.length < 15 || password.length > 128) return bad(res, 'A senha deve ter entre 15 e 128 caracteres.');
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -282,7 +284,7 @@ app.put('/api/profile', auth, csrf, async function(req,res) {
 
 app.put('/api/password', auth, csrf, async function(req,res) {
   const currentPassword=String(req.body.currentPassword||''), newPassword=String(req.body.newPassword||'');
-  if (newPassword.length<12 || newPassword.length>128) return bad(res,'A nova senha deve ter entre 12 e 128 caracteres.');
+  if (newPassword.length<15 || newPassword.length>128) return bad(res,'A nova senha deve ter entre 15 e 128 caracteres.');
   const found=await pool.query('SELECT password_hash,session_version FROM users WHERE id=$1',[req.user.id]);
   if (!(await bcrypt.compare(currentPassword,found.rows[0].password_hash))) return bad(res,'A senha atual está incorreta.',401);
   const hash=await bcrypt.hash(newPassword,12);
