@@ -293,6 +293,58 @@ app.post('/api/suppliers', auth, csrf, async function(req, res) {
   res.status(201).json({ id: result.rows[0].id });
 });
 
+ // EDITAR FORNECEDOR
+app.put('/api/suppliers/:id', auth, csrf, async function(req, res) {
+  const id = Number(req.params.id);
+  const body = req.body || {};
+
+  const name = String(body.name || '').trim();
+  const email = String(body.email || '').trim().toLowerCase();
+  const phone = String(body.phone || '').trim();
+  const notes = String(body.notes || '').trim();
+
+  if (!Number.isSafeInteger(id) || id <= 0 ||
+      name.length < 2 || name.length > 120 ||
+      (email && !validEmail(email)) ||
+      phone.length > 30 || notes.length > 1000) {
+    return bad(res, 'Dados do fornecedor inválidos.');
+  }
+
+  const result = await pool.query(
+    `UPDATE suppliers
+     SET name=$1, email=$2, phone=$3, notes=$4
+     WHERE id=$5 AND user_id=$6
+     RETURNING id`,
+    [name, email || null, phone || null, notes, id, req.user.id]
+  );
+
+  if (!result.rowCount) {
+    return bad(res, 'Fornecedor não encontrado.', 404);
+  }
+
+  res.json({ ok: true });
+});
+
+// EXCLUIR FORNECEDOR
+app.delete('/api/suppliers/:id', auth, csrf, async function(req, res) {
+  const id = Number(req.params.id);
+
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    return bad(res, 'ID inválido.');
+  }
+
+  const result = await pool.query(
+    'DELETE FROM suppliers WHERE id=$1 AND user_id=$2',
+    [id, req.user.id]
+  );
+
+  if (!result.rowCount) {
+    return bad(res, 'Fornecedor não encontrado.', 404);
+  }
+
+  res.json({ ok: true });
+});
+
 app.post('/api/transactions', auth, csrf, async function(req,res) {
   const title=String(req.body.title||'').trim(), type=req.body.type, amount=parseMoney(req.body.amount), categoryId=req.body.category_id, date=req.body.date, status=req.body.status, notes=String(req.body.notes||'').slice(0,1000);
   if (!title || title.length>120 || !validType(type) || !amount || !validDate(date) || !validStatus(status)) return bad(res,'Revise os dados do lançamento.');
