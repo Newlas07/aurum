@@ -220,7 +220,7 @@ app.post('/api/auth/login', async function(req, res) {
   }
 
   await pool.query('UPDATE users SET failed_login_count=0,locked_until=NULL,last_login_at=NOW() WHERE id=$1', [user.id]);
-  const csrfToken = issueAuth(res, user);
+  const csrfToken = await issueAuth(res, user, req);
   res.json({ user: { id:user.id, name:user.name, email:user.email }, csrfToken:csrfToken });
 });
 
