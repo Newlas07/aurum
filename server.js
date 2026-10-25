@@ -261,6 +261,38 @@ async function ownedCategory(userId, id, type) {
   return row && (!type || row.type===type) ? row : null;
 }
 
+ // LISTAR FORNECEDORES
+app.get('/api/suppliers', auth, async function(req, res) {
+  const result = await pool.query(
+    'SELECT id, name, email, phone, notes FROM suppliers WHERE user_id = $1 ORDER BY name',
+    [req.user.id]
+  );
+
+  res.json({ suppliers: result.rows });
+});
+
+// CADASTRAR FORNECEDOR
+app.post('/api/suppliers', auth, csrf, async function(req, res) {
+  const body = req.body || {};
+  const name = String(body.name || '').trim();
+  const email = String(body.email || '').trim().toLowerCase();
+  const phone = String(body.phone || '').trim();
+  const notes = String(body.notes || '').trim();
+
+  if (name.length < 2 || name.length > 120 ||
+      (email && !validEmail(email)) ||
+      phone.length > 30 || notes.length > 1000) {
+    return bad(res, 'Dados do fornecedor inválidos.');
+  }
+
+  const result = await pool.query(
+    'INSERT INTO suppliers (user_id, name, email, phone, notes) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+    [req.user.id, name, email || null, phone || null, notes]
+  );
+
+  res.status(201).json({ id: result.rows[0].id });
+});
+
 app.post('/api/transactions', auth, csrf, async function(req,res) {
   const title=String(req.body.title||'').trim(), type=req.body.type, amount=parseMoney(req.body.amount), categoryId=req.body.category_id, date=req.body.date, status=req.body.status, notes=String(req.body.notes||'').slice(0,1000);
   if (!title || title.length>120 || !validType(type) || !amount || !validDate(date) || !validStatus(status)) return bad(res,'Revise os dados do lançamento.');
