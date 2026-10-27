@@ -24,3 +24,4 @@ O Aurum é um aplicativo de finanças pessoais. Ele não deve coletar senhas ban
 
 ## Segurança contínua
 Nenhuma aplicação pode ser declarada “100% segura”. Mudanças futuras devem passar por revisão de autenticação, autorização, validação de entrada, dependências, logs e configuração de produção.
+

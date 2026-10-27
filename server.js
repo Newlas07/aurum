@@ -251,8 +251,12 @@ app.get('/api/data', auth, async function(req, res) {
 function parseMoney(v) { const n=Number(v); return Number.isSafeInteger(n) && n>=0 && n<=1000000000000 ? n : null; }
 function validType(v) { return v==='income' || v==='expense'; }
 function validStatus(v) { return v==='paid' || v==='pending'; }
-function validDate(v) { return /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')); }
-function validMonth(v) { return /^\d{4}-\d{2}$/.test(String(v || '')); }
+function validDate(v) {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v) || v.startsWith('0000')) return false;
+  const date = new Date(v + 'T12:00:00Z');
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0,10) === v;
+}
+function validMonth(v) { return typeof v === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(v) && !v.startsWith('0000'); }
 function validColor(v) { return /^#[0-9a-fA-F]{6}$/.test(String(v || '')); }
 
 async function ownedCategory(userId, id, type) {
@@ -534,22 +538,38 @@ app.delete('/api/security/account', auth, csrf, async function(req,res) {
   res.json({ ok:true });
 });
 
-app.use(express.static(__dirname, { index:'index.html', extensions:['html'], setHeaders:function(res,filePath){ if(filePath.endsWith('index.html')) res.setHeader('Cache-Control','no-cache'); } }));
+const procurement = require('./procurement.cjs')({app,pool,auth,csrf,bad,validDate,parseMoney,audit});
+
+// Only browser assets may be downloaded; server code and project files stay private.
+const publicAssets = new Set(['/index.html', '/app.js', '/styles.css', '/favicon.svg']);
+app.use(function(req, res, next) {
+  if (!['GET', 'HEAD'].includes(req.method)) return next();
+  const asset = req.path === '/' ? '/index.html' : req.path;
+  if (!publicAssets.has(asset)) return next();
+  if (asset === '/index.html') res.setHeader('Cache-Control', 'no-cache');
+  res.sendFile(path.join(__dirname, asset.slice(1)));
+});
 
 app.get('/{*splat}', function(req,res) {
   if (req.path.startsWith('/api/')) return res.status(404).json({error:'Rota não encontrada.'});
-  res.sendFile(path.join(__dirname,'index.html'));
+  res.status(404).send('Página não encontrada.');
 });
 
 app.use(function(err,req,res,next) {
   console.error(err);
   if (res.headersSent) return next(err);
+  if (err.code === '23503') return res.status(409).json({error:'Este registro está vinculado a uma cotação. Preserve o histórico ou remova a cotação em aberto primeiro.'});
   res.status(500).json({error:'Ocorreu um erro interno. Tente novamente.'});
 });
 
-initDb().then(function(){
-  app.listen(PORT,'0.0.0.0',function(){ console.log('Aurum online na porta '+PORT); });
-}).catch(function(err){
-  console.error('Falha ao inicializar o banco:',err);
-  process.exit(1);
-});
+const ready = initDb().then(procurement.ready);
+if (require.main === module) {
+  ready.then(function(){
+    app.listen(PORT,'0.0.0.0',function(){ console.log('Aurum online na porta '+PORT); });
+  }).catch(function(err){
+    console.error('Falha ao inicializar o banco:',err);
+    process.exit(1);
+  });
+}
+module.exports = { app, pool, ready };
+
