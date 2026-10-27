@@ -61,4 +61,8 @@ As rotas privadas exigem autenticação, segregam os dados por usuário e usam c
 
 ## Publicação
 
-A aplicação existente no Railway acompanha `main`. A revisão da 2.0 deve ser aprovada antes da integração. Após o merge, acompanhe o build e verifique `/health`, login e acesso às cotações. Os testes locais não substituem essa verificação no ambiente publicado.
+Ambiente público de testes: https://aurum-no1c.onrender.com, com aplicação gratuita no Render e PostgreSQL 18 gratuito no Neon. O primeiro acesso após inatividade pode demorar. Cada pessoa pode criar sua própria conta; a demonstração usa dados fictícios.
+
+O deploy inicial do commit ff840d7ebe9d8e5801b953f574ea9af286feccd7 passou pela verificação de saúde, cadastro, login, cookies de produção, fornecedores, produtos, comparação e aprovação concorrente sem duplicar despesas. A conta temporária de verificação foi excluída. O banco antigo do Railway não foi importado ou alterado.
+
+Para criar outro ambiente, use render.yaml e informe DATABASE_URL como segredo. O serviço gera JWT_SECRET automaticamente; nunca copie credenciais para o repositório. Consulte PUBLICACAO.md para operação e recuperação.

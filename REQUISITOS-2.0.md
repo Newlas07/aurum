@@ -10,7 +10,7 @@ Fonte: etapas 7 a 13 fornecidas pelo usuário em 26/10/2026. O histórico recupe
 | 10 | Comparação | Menor total completo, empates e economia potencial |
 | 11 | Integração financeira | Aprovação cria despesa pendente com vínculo único |
 | 12 | Testes e segurança | Testes HTTP/SQL de autenticação, permissões, cálculos e duplicação; verificação visual desktop e celular |
-| 13 | Publicação | Preparar revisão no GitHub; integrar após aprovação e conferir deploy no Railway |
+| 13 | Publicação | Ambiente de testes publicado no Render com PostgreSQL Neon; substitui Railway conforme decisão do usuário |
 
 Decisões de implementação: preços em centavos, quantidade com até três casas decimais, limite de 50 itens por cotação, uma proposta editável por fornecedor, comparação incluindo frete/desconto e preservação do histórico dos itens. A economia usa a proposta completa mais cara como referência. Essas regras estão explicadas na interface e no README.
 

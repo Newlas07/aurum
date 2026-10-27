@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: aurum
+    runtime: node
+    plan: free
+    buildCommand: corepack pnpm install --frozen-lockfile --prod
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: SESSION_TTL_HOURS
+        value: "12"
+      - key: PGSSLMODE
+        value: verify-full
+      - key: DATABASE_URL
+        sync: false

@@ -10,7 +10,7 @@ O Aurum é um aplicativo de finanças pessoais. Ele não deve coletar senhas ban
 - Rate limiting de API, autenticação e confirmação de senha; bloqueio progressivo no banco com incremento atômico. Processamento de senha limitado a duas operações simultâneas e fila limitada.
 - Consultas SQL parametrizadas.
 - Autorização por usuário em todas as entidades.
-- PostgreSQL persistente no Railway.
+- PostgreSQL persistente no Neon para o ambiente público de testes; banco antigo do Railway preservado.
 - Segredos fora do GitHub.
 - Tokens JWT restritos a HS256, issuer/audience e sessão válida no banco. Logout, expiração e troca de senha invalidam sessões.
 - API com Cache-Control: no-store, JSON limitado a 50 KB e validação de datas, valores, quantidades e IDs.
@@ -20,7 +20,7 @@ O Aurum é um aplicativo de finanças pessoais. Ele não deve coletar senhas ban
 - Download restrito aos arquivos públicos; contatos e descrições escapados no HTML; fórmulas neutralizadas no CSV, inclusive com espaços iniciais.
 
 ## Regras operacionais
-- Use MFA no GitHub e Railway.
+- Use MFA nas contas dos provedores, incluindo GitHub, Render e Neon.
 - Nunca salve segredos no repositório.
 - Rode pnpm audit --prod --audit-level high regularmente.
 - Mantenha dependências atualizadas.
