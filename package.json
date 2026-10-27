@@ -1,15 +1,17 @@
 {
   "name": "aurum",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "description": "Aurum - aplicação de finanças pessoais",
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js",
-    "security:audit": "npm audit --omit=dev --audit-level=high"
+    "test": "node --test --test-isolation=none test/*.test.cjs",
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "node scripts/dev.cjs",
+    "security:audit": "pnpm audit --prod --audit-level high"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",
@@ -19,5 +21,9 @@
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.11",
+    "@electric-sql/pglite-socket": "^0.2.14"
   }
 }
