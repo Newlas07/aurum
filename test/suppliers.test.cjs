@@ -68,3 +68,19 @@ test('CSV export neutralizes formulas with leading whitespace and escapes quotes
   assert.equal(run(`csvCell('  =HYPERLINK("bad")')`),`"'  =HYPERLINK(""bad"")"`);
   assert.equal(run(`csvCell('Texto normal')`),'"Texto normal"');
 });
+test('money inputs preserve Brazilian thousands and cents without rounding away precision',()=>{
+  const {run,context}=setup();
+  for(const [value,expected] of [['10.000',1000000],['1.000',100000],['10.000,50',1000050],['10000,50',1000050],['10000.50',1000050],['0,01',1],[' R$ 1.234,56 ',123456],['10.000.000.000,00',1000000000000]]){
+    context.moneyValue=value;assert.equal(run('toCents(moneyValue)'),expected,value);
+  }
+  for(const value of ['1,234','1.23,45','1e3','-100','NaN','','1,2,3','10.000.000.000,01']){
+    context.moneyValue=value;assert.throws(()=>run('toCents(moneyValue)'),undefined,value);
+  }
+});
+test('goal editor accepts localized text amounts and keeps saved cents when editing',()=>{
+  const {run,modal}=setup();
+  run("state.data.goals=[{id:8,name:'Casa Nova',target:1000000,saved:100000,deadline:'2030-02-01',color:'#709487'}];editor('goals','8');");
+  assert.match(modal.innerHTML,/name="target" type="text" value="10000,00"/);
+  assert.match(modal.innerHTML,/name="saved" type="text" value="1000,00"/);
+  assert.match(modal.innerHTML,/inputmode="decimal"/);
+});
