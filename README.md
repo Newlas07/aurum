@@ -12,6 +12,7 @@ Aplicação de finanças pessoais e organização de cotações, com contas indi
 - Comparação de valores com quantidade, frete e desconto. Propostas incompletas não recebem indicação de menor total.
 - Aprovação de uma proposta e criação de uma despesa pendente. Repetir a aprovação retorna o lançamento existente.
 - Interface responsiva, incluindo tabelas com rolagem horizontal no celular.
+- Tema claro, escuro ou do dispositivo em Configurações → Aparência; preferência salva no navegador.
 
 ## Desenvolvimento local
 
@@ -22,7 +23,7 @@ pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-Abra http://127.0.0.1:3000. Esse comando usa PostgreSQL embarcado via PGlite exclusivamente para desenvolvimento. Os dados ficam em `data/dev`, fora do Git. A chave de sessão é temporária: após reiniciar, entre novamente na conta. Nenhum dado do Railway é copiado ou usado.
+Abra http://127.0.0.1:3000. Esse comando usa PostgreSQL embarcado via PGlite exclusivamente para desenvolvimento. Os dados ficam em `data/dev-3000`, fora do Git (ou `data/dev-<PORT>` se outra porta for configurada). A chave de sessão é temporária: após reiniciar, entre novamente na conta. Nenhum dado do Railway é copiado ou usado.
 
 ## Servidor PostgreSQL / produção
 
@@ -33,7 +34,7 @@ pnpm install --frozen-lockfile --prod
 pnpm start
 ```
 
-O servidor cria as tabelas e adiciona a coluna de vínculo com cotações sem apagar dados existentes. Faça backup do PostgreSQL antes da primeira atualização da 2.0. Para produção, use a rede privada entre aplicação e banco no Railway. A configuração `PGSSLMODE=require` herdada do projeto desativa a validação do certificado: não a use como substituto de uma configuração TLS verificada em bancos públicos.
+O servidor cria as tabelas e adiciona a coluna de vínculo com cotações sem apagar dados existentes. Faça backup do PostgreSQL antes da primeira atualização da 2.0. Use a rede privada entre aplicação e banco no Railway. Bancos externos em produção exigem TLS com certificado validado (`PGSSLMODE=require` ou `verify-full`); uma CA própria pode ser informada por `PGSSLROOTCERT`. URLs com modos TLS inseguros são rejeitadas. A presença de `RAILWAY_PROJECT_ID` ativa as proteções de produção mesmo se NODE_ENV tiver sido omitido.
 
 ## Testes
 
@@ -42,7 +43,7 @@ pnpm test
 pnpm audit --prod --audit-level high
 ```
 
-Por padrão, os testes usam um banco PGlite em memória e o driver `pg` pelo protocolo PostgreSQL. O GitHub Actions executa os mesmos testes com PostgreSQL 16 real. Para usar um banco de testes próprio, configure `AURUM_TEST_DATABASE_URL` apontando para `localhost` ou `127.0.0.1`, com nome terminado em `_test`. Use um banco vazio e descartável; os testes criam dados fictícios.
+Por padrão, os testes usam um banco PGlite em memória e o driver `pg` pelo protocolo PostgreSQL. Como PGlite possui um único backend, a suíte local usa uma conexão do pool para evitar interferência entre mensagens de conexões diferentes. O GitHub Actions executa os mesmos testes com PostgreSQL 16 e 18 reais, usando o pool normal e requisições concorrentes. Para usar um banco de testes próprio, configure `AURUM_TEST_DATABASE_URL` apontando para `localhost` ou `127.0.0.1`, com nome terminado em `_test`. Use um banco vazio e descartável; os testes criam dados fictícios.
 
 ## Regras de cotações
 
@@ -56,7 +57,7 @@ Uma cotação aprovada não aceita mudanças nas propostas nem exclusão. Se o l
 
 ## Segurança
 
-As rotas exigem autenticação, segregam os dados por usuário e usam consultas parametrizadas. Alterações exigem CSRF e validação de origem. O servidor limita tentativas e requisições, usa Helmet/CSP e só serve os quatro arquivos públicos da interface. Código do servidor, arquivos de ambiente e testes não são expostos como arquivos estáticos.
+As rotas privadas exigem autenticação, segregam os dados por usuário e usam consultas parametrizadas. Alterações exigem CSRF assinado vinculado à sessão e validação de origem. Novas senhas usam scrypt; hashes bcrypt existentes são atualizados no login. O servidor limita tentativas e processamento de senhas, usa Helmet/CSP e só serve os cinco arquivos públicos da interface. Código do servidor, arquivos de ambiente e testes não são expostos como arquivos estáticos. Consulte SECURITY.md para os controles e limites.
 
 ## Publicação
 

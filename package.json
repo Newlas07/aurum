@@ -8,7 +8,7 @@
     "test": "node --test --test-isolation=none test/*.test.cjs",
     "start": "node --env-file-if-exists=.env server.js",
     "dev": "node scripts/dev.cjs",
-    "security:audit": "npm audit --omit=dev --audit-level=high"
+    "security:audit": "pnpm audit --prod --audit-level high"
   },
   "engines": {
     "node": ">=24"

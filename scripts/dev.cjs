@@ -6,10 +6,11 @@ const crypto=require('node:crypto');
 (async()=>{
   if(process.env.NODE_ENV==='production')throw new Error('Este comando é apenas para desenvolvimento local.');
   require('node:fs').mkdirSync(path.join(__dirname,'../data'),{recursive:true});
-  const db=await PGlite.create(path.join(__dirname,'../data/dev'));
-  const socket=new PGLiteSocketServer({db,port:15440,host:'127.0.0.1',maxConnections:20});
+  const port=Number(process.env.PORT||3000),dbPort=port+12440;
+  const db=await PGlite.create(path.join(__dirname,'../data/dev-'+port));
+  const socket=new PGLiteSocketServer({db,port:dbPort,host:'127.0.0.1',maxConnections:20});
   await socket.start();
-  process.env.DATABASE_URL='postgresql://postgres:postgres@127.0.0.1:15440/postgres';
+  process.env.DATABASE_URL='postgresql://postgres:postgres@127.0.0.1:'+dbPort+'/postgres';
   process.env.JWT_SECRET=crypto.randomBytes(48).toString('hex');
   process.env.NODE_ENV='development';
   const {app,pool,ready}=require('../server');await ready;

@@ -1,8 +1,8 @@
 // Procurement is isolated from the existing finance routes to preserve their behavior.
 module.exports = function procurement({app,pool,auth,csrf,bad,validDate,parseMoney,audit}) {
-  const id = value => Number.isSafeInteger(Number(value)) && Number(value)>0 ? Number(value) : null;
+  const id = value => ['number','string'].includes(typeof value)&&/^[1-9][0-9]*$/.test(String(value))&&Number.isSafeInteger(Number(value)) ? Number(value) : null;
   const text = value => String(value ?? '').trim();
-  const quantity = value => /^\d+(\.\d{1,3})?$/.test(String(value)) && Number(value)>0 && Number(value)<=1000000 ? Number(value) : null;
+  const quantity = value => ['number','string'].includes(typeof value)&&/^\d+(\.\d{1,3})?$/.test(String(value)) && Number(value)>0 && Number(value)<=1000000 ? Number(value) : null;
   const fail = (message,status=400) => Object.assign(new Error(message),{status});
   async function transaction(work) {
     const client=await pool.connect();
@@ -76,6 +76,7 @@ module.exports = function procurement({app,pool,auth,csrf,bad,validDate,parseMon
     const result=await transaction(async client=>{
       const q=(await client.query('INSERT INTO quotations(user_id,title,notes) VALUES($1,$2,$3) RETURNING id',[req.user.id,title,notes])).rows[0];
       for(const item of items){
+        if(!item||typeof item!=='object'||Array.isArray(item))throw fail('Item inválido.');
         const p=(await client.query('SELECT * FROM products WHERE id=$1 AND user_id=$2',[id(item.product_id),req.user.id])).rows[0];
         const qty=quantity(item.quantity);if(!p||!qty)throw fail('Produto ou quantidade inválida.');
         await client.query('INSERT INTO quotation_items(quotation_id,product_id,name,description,quantity,unit) VALUES($1,$2,$3,$4,$5,$6)',[q.id,p.id,p.name,p.description,qty,p.unit]);
@@ -94,6 +95,7 @@ module.exports = function procurement({app,pool,auth,csrf,bad,validDate,parseMon
       const items=(await client.query('SELECT id,quantity FROM quotation_items WHERE quotation_id=$1',[q.id])).rows;
       const seen=new Set();let subtotal=0n;
       for(const line of b.items){
+        if(!line||typeof line!=='object'||Array.isArray(line))throw fail('Preço inválido.');
         const item=items.find(v=>v.id===id(line.quotation_item_id)),price=parseMoney(line.unit_price);
         if(!item||price===null||seen.has(item.id))throw fail('Itens ou preços inválidos.');
         seen.add(item.id);subtotal+=(BigInt(Math.round(Number(item.quantity)*1000))*BigInt(price)+500n)/1000n;
@@ -111,13 +113,14 @@ module.exports = function procurement({app,pool,auth,csrf,bad,validDate,parseMon
       const q=await quote(client,req.user.id,id(req.params.id),true),pid=id(b.proposal_id);
       if(q.approved_proposal_id&&q.approved_proposal_id!==pid)throw fail('Outra proposta já foi aprovada.',409);
       const existing=(await client.query('SELECT id FROM transactions WHERE quotation_id=$1 AND user_id=$2',[q.id,req.user.id])).rows[0];
-      if(existing)return {transaction_id:existing.id,reused:true};
+      if(existing){await audit(req,'quotation_approved',req.user.id,{quotation_id:q.id,reused:true},client);return {transaction_id:existing.id,reused:true};}
       const data=await comparison(client,req.user.id,q.id),offer=data.proposals.find(p=>p.id===pid);
       if(!offer||!offer.complete||offer.total<=0)throw fail('Escolha uma proposta completa com total maior que zero.');
       const category=await client.query("SELECT id FROM categories WHERE id=$1 AND user_id=$2 AND type='expense'",[id(b.category_id),req.user.id]);if(!category.rowCount)throw fail('Escolha uma categoria de despesa válida.');
       const t=(await client.query("INSERT INTO transactions(user_id,title,type,amount,category_id,date,status,notes,quotation_id) VALUES($1,$2,'expense',$3,$4,$5,'pending',$6,$7) RETURNING id",[req.user.id,q.title,offer.total,id(b.category_id),b.date,('Cotação #'+q.id+' · '+offer.supplier_name+' · '+offer.conditions).slice(0,1000),q.id])).rows[0];
-      await client.query('UPDATE quotations SET approved_proposal_id=$1 WHERE id=$2',[pid,q.id]);return {transaction_id:t.id,reused:false};
-    });await audit(req,'quotation_approved',req.user.id,{quotation_id:id(req.params.id)});res.json(result);
+      await client.query('UPDATE quotations SET approved_proposal_id=$1 WHERE id=$2',[pid,q.id]);
+      await audit(req,'quotation_approved',req.user.id,{quotation_id:q.id,reused:false},client);return {transaction_id:t.id,reused:false};
+    });res.json(result);
   });
   return {ready};
 };

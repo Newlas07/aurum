@@ -63,3 +63,8 @@ test('demo blocks supplier changes', () => {
   run(`state.demo=true;toast=()=>{};editor('suppliers');`);
   assert.equal(modal.innerHTML,'');
 });
+test('CSV export neutralizes formulas with leading whitespace and escapes quotes',()=>{
+  const {run}=setup();
+  assert.equal(run(`csvCell('  =HYPERLINK("bad")')`),`"'  =HYPERLINK(""bad"")"`);
+  assert.equal(run(`csvCell('Texto normal')`),'"Texto normal"');
+});

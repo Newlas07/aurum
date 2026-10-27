@@ -3,28 +3,31 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const bcrypt = require('bcryptjs');
+const {hashPassword,verifyPassword,needsUpgrade}=require('./passwords.cjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const path = require('path');
 const { Pool, types } = require('pg');
 
 types.setTypeParser(20, Number);
+// Railway is a production runtime even if NODE_ENV was omitted or misconfigured.
+if(process.env.RAILWAY_PROJECT_ID)process.env.NODE_ENV='production';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET;
-const SESSION_TTL_HOURS = Math.min(Math.max(Number(process.env.SESSION_TTL_HOURS || 12), 1), 168);
+const configuredTtl=Number(process.env.SESSION_TTL_HOURS||12);
+if(!Number.isFinite(configuredTtl)||configuredTtl<1||configuredTtl>168)throw new Error('SESSION_TTL_HOURS deve estar entre 1 e 168.');
+const SESSION_TTL_HOURS = configuredTtl;
 const SESSION_TTL_MS = SESSION_TTL_HOURS * 60 * 60 * 1000;
 
 if (!DATABASE_URL) throw new Error('DATABASE_URL não configurada.');
 if (!JWT_SECRET || JWT_SECRET.length < 32) throw new Error('JWT_SECRET deve ter pelo menos 32 caracteres.');
 
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: false } : false
-});
+const dbConfig=require('./database-config.cjs')(DATABASE_URL);
+if(process.env.NODE_ENV==='test'&&process.env.AURUM_TEST_SINGLE_CONNECTION==='1')dbConfig.max=1;
+const pool = new Pool(dbConfig);
 
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
@@ -45,6 +48,11 @@ app.use(helmet({
 }));
 app.use(express.json({ limit: '50kb', strict: true }));
 app.use(cookieParser());
+app.use('/api',function(req,res,next){
+  res.setHeader('Cache-Control','no-store');
+  if(!['GET','HEAD','OPTIONS'].includes(req.method)&&(!req.is('application/json')||!req.body||Array.isArray(req.body)||typeof req.body!=='object'))return res.status(400).json({error:'Envie um objeto JSON válido.'});
+  next();
+});
 
 function sameOriginGuard(req, res, next) {
   if (['GET','HEAD','OPTIONS'].includes(req.method)) return next();
@@ -67,16 +75,23 @@ const secureCookie = process.env.NODE_ENV === 'production';
 const authCookie = { httpOnly: true, secure: secureCookie, sameSite: 'strict', maxAge: SESSION_TTL_MS, path: '/' };
 const csrfCookie = { httpOnly: false, secure: secureCookie, sameSite: 'strict', maxAge: SESSION_TTL_MS, path: '/' };
 
-function issueCsrf(res) {
-  const token = crypto.randomBytes(24).toString('hex');
+function csrfSignature(nonce,jti){return crypto.createHmac('sha256',JWT_SECRET).update('csrf:'+jti+':'+nonce).digest('hex');}
+function validCsrf(token,jti){
+  if(typeof token!=='string'||!/^([a-f0-9]{48})\.([a-f0-9]{64})$/.test(token))return false;
+  const [nonce,signature]=token.split('.');
+  return crypto.timingSafeEqual(Buffer.from(signature,'hex'),Buffer.from(csrfSignature(nonce,jti),'hex'));
+}
+function issueCsrf(res,jti) {
+  const nonce = crypto.randomBytes(24).toString('hex');
+  const token=nonce+'.'+csrfSignature(nonce,jti);
   res.cookie('csrf_token', token, csrfCookie);
   return token;
 }
 
-async function issueAuth(res, user, req) {
+async function issueAuth(res, user, req, connection=pool) {
   const jti = crypto.randomUUID();
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
-  await pool.query(
+  await connection.query(
     'INSERT INTO sessions (jti,user_id,user_agent,expires_at) VALUES ($1,$2,$3,$4)',
     [jti, user.id, String(req.get('user-agent') || '').slice(0,300), expiresAt]
   );
@@ -86,7 +101,7 @@ async function issueAuth(res, user, req) {
     { expiresIn: SESSION_TTL_HOURS + 'h', issuer: 'aurum', audience: 'aurum-web', jwtid: jti }
   );
   res.cookie('auth_token', token, authCookie);
-  return issueCsrf(res);
+  return issueCsrf(res,jti);
 }
 
 function cleanEmail(value) { return String(value || '').trim().toLowerCase(); }
@@ -95,14 +110,15 @@ function bad(res, message, status) { return res.status(status || 400).json({ err
 function hashIp(value) {
   return crypto.createHmac('sha256', JWT_SECRET).update(String(value || '')).digest('hex');
 }
-async function audit(req, event, userId, details) {
+async function audit(req, event, userId, details, connection=pool) {
   try {
-    await pool.query(
+    await connection.query(
       'INSERT INTO audit_logs (user_id,event,ip_hash,user_agent,details) VALUES ($1,$2,$3,$4,$5::jsonb)',
       [userId || null, event, hashIp(req.ip), String(req.get('user-agent') || '').slice(0,300), JSON.stringify(details || {})]
     );
   } catch (e) {
-    console.error('Falha ao registrar auditoria:', e.message);
+    console.error('Falha ao registrar auditoria:', e.code||e.name);
+    throw e;
   }
 }
 
@@ -110,7 +126,8 @@ async function auth(req, res, next) {
   try {
     const token = req.cookies.auth_token;
     if (!token) return bad(res, 'Sessão não encontrada. Entre novamente.', 401);
-    const payload = jwt.verify(token, JWT_SECRET, { issuer: 'aurum', audience: 'aurum-web' });
+    const payload = jwt.verify(token, JWT_SECRET, { algorithms:['HS256'],issuer: 'aurum', audience: 'aurum-web' });
+    if(!Number.isSafeInteger(payload.uid)||typeof payload.jti!=='string'||!/^\w{8}-\w{4}-\w{4}-\w{4}-\w{12}$/.test(payload.jti))return bad(res,'Sessão inválida.',401);
     const result = await pool.query(
       'SELECT u.id,u.name,u.email,u.session_version,s.jti FROM users u JOIN sessions s ON s.user_id=u.id WHERE u.id=$1 AND s.jti=$2 AND s.revoked_at IS NULL AND s.expires_at>NOW()',
       [payload.uid, payload.jti]
@@ -129,7 +146,7 @@ async function auth(req, res, next) {
 function csrf(req, res, next) {
   const sent = req.get('x-csrf-token');
   const cookie = req.cookies.csrf_token;
-  if (!sent || !cookie || sent !== cookie) return bad(res, 'Sessão de segurança expirada. Recarregue a página.', 403);
+  if (!sent || !cookie || sent !== cookie || !validCsrf(sent,req.sessionJti)) return bad(res, 'Sessão de segurança expirada. Recarregue a página.', 403);
   next();
 }
 
@@ -166,7 +183,7 @@ async function createDefaults(client, userId) {
   }
 }
 
-app.get('/health', function(req, res) { res.json({ ok: true }); });
+app.get('/health', async function(req, res) {try{await pool.query('SELECT 1');res.json({ok:true,version:'2.0.0'});}catch{res.status(503).json({ok:false});}});
 
 app.post('/api/auth/register', async function(req, res) {
   const name = String(req.body.name || '').trim();
@@ -180,17 +197,17 @@ app.post('/api/auth/register', async function(req, res) {
     await client.query('BEGIN');
     const exists = await client.query('SELECT 1 FROM users WHERE LOWER(email)=LOWER($1)', [email]);
     if (exists.rowCount) { await client.query('ROLLBACK'); return bad(res, 'Já existe uma conta com este e-mail.', 409); }
-    const hash = await bcrypt.hash(password, 12);
+    const hash = await hashPassword(password);
     const result = await client.query('INSERT INTO users (name,email,password_hash) VALUES ($1,$2,$3) RETURNING id,name,email,session_version', [name,email,hash]);
     const user = result.rows[0];
     await createDefaults(client, user.id);
+    const csrfToken = await issueAuth(res, user, req,client);
+    await audit(req, 'account_registered', user.id, {},client);
     await client.query('COMMIT');
-    const csrfToken = await issueAuth(res, user, req);
-    await audit(req, 'account_registered', user.id, {});
     res.status(201).json({ user: { id:user.id, name:user.name, email:user.email }, csrfToken:csrfToken });
   } catch (e) {
     await client.query('ROLLBACK');
-    console.error(e);
+    console.error('Falha ao criar conta:',e.code||e.name);
     bad(res, 'Não foi possível criar a conta.', 500);
   } finally {
     client.release();
@@ -200,6 +217,7 @@ app.post('/api/auth/register', async function(req, res) {
 app.post('/api/auth/login', async function(req, res) {
   const email = cleanEmail(req.body.email);
   const password = String(req.body.password || '');
+  if(!validEmail(email)||!password||password.length>128)return bad(res,'E-mail ou senha incorretos.',401);
   const result = await pool.query('SELECT id,name,email,password_hash,session_version,failed_login_count,locked_until FROM users WHERE LOWER(email)=LOWER($1)', [email]);
   const user = result.rows[0];
 
@@ -207,27 +225,23 @@ app.post('/api/auth/login', async function(req, res) {
     return bad(res, 'Muitas tentativas. Aguarde alguns minutos e tente novamente.', 429);
   }
 
-  const valid = user ? await bcrypt.compare(password, user.password_hash) : false;
+  const valid = await verifyPassword(password,user?.password_hash||await dummyPasswordHash);
   if (!user || !valid) {
     if (user) {
-      const failures = Number(user.failed_login_count || 0) + 1;
-      const lockMinutes = failures >= 5 ? Math.min(60, 5 * Math.pow(2, Math.min(failures - 5, 4))) : 0;
-      await pool.query(
-        "UPDATE users SET failed_login_count=$1,locked_until=CASE WHEN $2::int>0 THEN NOW()+($2::text||' minutes')::interval ELSE NULL END WHERE id=$3",
-        [failures, lockMinutes, user.id]
-      );
-      await audit(req, 'login_failed', user.id, { locked: lockMinutes > 0 });
+      const failed=await pool.query("UPDATE users SET failed_login_count=LEAST(failed_login_count+1,1000000),locked_until=CASE WHEN failed_login_count+1>=5 THEN NOW()+(LEAST(60,5*POWER(2,LEAST(failed_login_count+1-5,4)))::text||' minutes')::interval ELSE NULL END WHERE id=$1 RETURNING locked_until",[user.id]);
+      await audit(req, 'login_failed', user.id, { locked: Boolean(failed.rows[0]?.locked_until) });
     }
     return bad(res, 'E-mail ou senha incorretos.', 401);
   }
 
   await pool.query('UPDATE users SET failed_login_count=0,locked_until=NULL,last_login_at=NOW() WHERE id=$1', [user.id]);
+  if(needsUpgrade(user.password_hash))await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2 AND password_hash=$3',[await hashPassword(password),user.id,user.password_hash]);
   const csrfToken = await issueAuth(res, user, req);
   res.json({ user: { id:user.id, name:user.name, email:user.email }, csrfToken:csrfToken });
 });
 
 app.get('/api/session', auth, function(req, res) {
-  const csrfToken = req.cookies.csrf_token || issueCsrf(res);
+  const csrfToken = validCsrf(req.cookies.csrf_token,req.sessionJti)?req.cookies.csrf_token:issueCsrf(res,req.sessionJti);
   res.json({ user: { id:req.user.id, name:req.user.name, email:req.user.email }, csrfToken:csrfToken });
 });
 
@@ -248,7 +262,7 @@ app.get('/api/data', auth, async function(req, res) {
   res.json({ user:{id:req.user.id,name:req.user.name,email:req.user.email}, categories:categories.rows, transactions:transactions.rows, budgets:budgets.rows, goals:goals.rows });
 });
 
-function parseMoney(v) { const n=Number(v); return Number.isSafeInteger(n) && n>=0 && n<=1000000000000 ? n : null; }
+function parseMoney(v) { if(!['number','string'].includes(typeof v)||String(v).trim()===''||!/^[0-9]+$/.test(String(v)))return null;const n=Number(v); return Number.isSafeInteger(n) && n>=0 && n<=1000000000000 ? n : null; }
 function validType(v) { return v==='income' || v==='expense'; }
 function validStatus(v) { return v==='paid' || v==='pending'; }
 function validDate(v) {
@@ -444,12 +458,13 @@ app.put('/api/profile', auth, csrf, async function(req,res) {
   res.json({ok:true});
 });
 
-app.put('/api/password', auth, csrf, async function(req,res) {
+const reauthenticationLimit=rateLimit({windowMs:15*60*1000,limit:10,keyGenerator:req=>String(req.user.id),standardHeaders:'draft-8',legacyHeaders:false,message:{error:'Muitas tentativas de confirmação. Aguarde alguns minutos.'}});
+app.put('/api/password', auth, csrf, reauthenticationLimit, async function(req,res) {
   const currentPassword=String(req.body.currentPassword||''), newPassword=String(req.body.newPassword||'');
   if (newPassword.length<15 || newPassword.length>128) return bad(res,'A nova senha deve ter entre 15 e 128 caracteres.');
   const found=await pool.query('SELECT password_hash,session_version FROM users WHERE id=$1',[req.user.id]);
-  if (!(await bcrypt.compare(currentPassword,found.rows[0].password_hash))) return bad(res,'A senha atual está incorreta.',401);
-  const hash=await bcrypt.hash(newPassword,12);
+  if (!(await verifyPassword(currentPassword,found.rows[0].password_hash))) return bad(res,'A senha atual está incorreta.',401);
+  const hash=await hashPassword(newPassword);
   const updated=await pool.query('UPDATE users SET password_hash=$1,session_version=session_version+1 WHERE id=$2 RETURNING id,name,email,session_version',[hash,req.user.id]);
   await pool.query('UPDATE sessions SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL',[req.user.id]);
   const csrfToken=await issueAuth(res,updated.rows[0],req);
@@ -522,17 +537,24 @@ app.post('/api/security/logout-all', auth, csrf, async function(req,res) {
   res.json({ ok:true, revoked:result.rowCount });
 });
 
-app.delete('/api/security/account', auth, csrf, async function(req,res) {
+app.delete('/api/security/account', auth, csrf, reauthenticationLimit, async function(req,res) {
   const password = String(req.body.password || '');
   const confirm = String(req.body.confirm || '');
   if (confirm !== 'EXCLUIR') return bad(res, 'Digite EXCLUIR para confirmar.', 400);
   const found = await pool.query('SELECT password_hash FROM users WHERE id=$1', [req.user.id]);
-  if (!found.rows[0] || !(await bcrypt.compare(password, found.rows[0].password_hash))) {
+  if (!found.rows[0] || !(await verifyPassword(password, found.rows[0].password_hash))) {
     await audit(req, 'account_delete_failed', req.user.id, {});
     return bad(res, 'Senha incorreta.', 401);
   }
-  await audit(req, 'account_deleted', req.user.id, {});
-  await pool.query('DELETE FROM users WHERE id=$1', [req.user.id]);
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    await audit(req,'account_deleted',req.user.id,{},client);
+    // Delete quotations first: their proposals restrict supplier deletion.
+    await client.query('DELETE FROM quotations WHERE user_id=$1',[req.user.id]);
+    await client.query('DELETE FROM users WHERE id=$1',[req.user.id]);
+    await client.query('COMMIT');
+  }catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}
   res.clearCookie('auth_token', { path:'/' });
   res.clearCookie('csrf_token', { path:'/' });
   res.json({ ok:true });
@@ -541,7 +563,7 @@ app.delete('/api/security/account', auth, csrf, async function(req,res) {
 const procurement = require('./procurement.cjs')({app,pool,auth,csrf,bad,validDate,parseMoney,audit});
 
 // Only browser assets may be downloaded; server code and project files stay private.
-const publicAssets = new Set(['/index.html', '/app.js', '/styles.css', '/favicon.svg']);
+const publicAssets = new Set(['/index.html', '/app.js', '/theme.js', '/styles.css', '/favicon.svg']);
 app.use(function(req, res, next) {
   if (!['GET', 'HEAD'].includes(req.method)) return next();
   const asset = req.path === '/' ? '/index.html' : req.path;
@@ -556,13 +578,17 @@ app.get('/{*splat}', function(req,res) {
 });
 
 app.use(function(err,req,res,next) {
-  console.error(err);
+  console.error('Falha na requisição:',err.code||err.type||err.name);
   if (res.headersSent) return next(err);
+  if(err.type==='entity.too.large')return res.status(413).json({error:'A solicitação excede o tamanho permitido.'});
+  if(err.type==='entity.parse.failed')return res.status(400).json({error:'JSON inválido.'});
+  if(err.status===503)return res.status(503).json({error:'Autenticação ocupada. Tente novamente.'});
   if (err.code === '23503') return res.status(409).json({error:'Este registro está vinculado a uma cotação. Preserve o histórico ou remova a cotação em aberto primeiro.'});
   res.status(500).json({error:'Ocorreu um erro interno. Tente novamente.'});
 });
 
-const ready = initDb().then(procurement.ready);
+const dummyPasswordHash=hashPassword(crypto.randomBytes(32).toString('hex'));
+const ready = initDb().then(procurement.ready).then(()=>dummyPasswordHash);
 if (require.main === module) {
   ready.then(function(){
     app.listen(PORT,'0.0.0.0',function(){ console.log('Aurum online na porta '+PORT); });
